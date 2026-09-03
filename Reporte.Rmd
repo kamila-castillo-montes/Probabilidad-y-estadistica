@@ -1,0 +1,219 @@
+---
+title: "Análisis Probabilidad y Estadística Computacional"
+author: "Kamila Castillo Montes"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r configuracion, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. ¿De qué trata este análisis?
+
+En el trabajo diario de un equipo de software y DevOps, monitorear el tiempo que tarda un cambio desde que se escribe hasta que llega a producción (*Lead Time for Changes*) es clave para entender si los procesos son ágiles o si hay cuellos de botella.
+
+En este informe asumo el rol de analista para examinar un histórico simulado de 5.000 eventos de despliegue. El objetivo es responder preguntas prácticas de ingeniería con respaldo numérico: ¿cuánto tarda normalmente un pase a producción?, ¿qué equipos o módulos concentran más demoras?, y ¿los cambios más grandes realmente provocan más bugs o fallas en el sistema?
+
+---
+
+# 2. Preparación y Depuración del Dataset
+
+Para reflejar un escenario real de operaciones, el conjunto de datos no viene perfectamente limpio: combina cambios rápidos con entregas mayores, arrastra registros repetidos por fallos de timeout y presenta casos extremos de tareas bloqueadas.
+
+Además, se acota la métrica a valores estrictamente no negativos (las horas de trabajo no pueden ser menores a cero) y se vincula el tamaño del cambio con la probabilidad de registrar bugs y fallas en el despliegue.
+
+```{r preparacion_datos}
+if (!requireNamespace("moments", quietly = TRUE)) install.packages("moments")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+
+library(moments)
+library(dplyr)
+
+set.seed(2026)
+n <- 5000
+
+# 1. Simulación bimodal: cambios rápidos (~4 hrs) vs. desarrollos mayores (~48 hrs)
+n1 <- round(n * 0.58)
+modo_rapido <- rgamma(n1, shape = 2.3, scale = 1.8)
+
+n2 <- round(n * 0.38)
+modo_lento <- rlnorm(n2, meanlog = log(48), sdlog = 0.38)
+
+n3 <- n - n1 - n2
+outliers_extremos <- runif(n3, min = 140, max = 320)
+
+horas_raw <- sample(c(modo_rapido, modo_lento, outliers_extremos))
+
+# Datos no limpios: mezcla de enteros y números reales
+horas_raw <- ifelse(runif(n) > 0.50, round(horas_raw), round(horas_raw, 2))
+
+# Introducir valores duplicados sistemáticos por timeouts fijos
+indices_duplicados <- sample(1:n, size = 160)
+horas_raw[indices_duplicados] <- rep(c(24, 48, 72), length.out = 160)
+
+# Restricción física: horas >= 0
+horas_raw <- pmax(horas_raw, 0)
+
+# Variables categóricas
+equipos     <- sample(c("Alpha", "Beta", "Gamma", "Delta"), size = n, replace = TRUE, 
+                      prob = c(0.28, 0.26, 0.24, 0.22))
+modulos     <- sample(c("Auth-Service", "Billing", "Frontend-UI", "Core-API", "Database"), 
+                      size = n, replace = TRUE)
+prioridades <- sample(c("Baja", "Media", "Alta", "Crítica"), size = n, replace = TRUE, 
+                      prob = c(0.20, 0.45, 0.25, 0.10))
+
+# Dataframe consolidado
+df_devops <- data.frame(
+  commit_id       = paste0("PR-", 10001:(10000 + n)),
+  equipo          = equipos,
+  modulo          = modulos,
+  prioridad       = prioridades,
+  lead_time_horas = horas_raw,
+  stringsAsFactors = FALSE
+)
+
+# Variable complementaria: Líneas de Código (LoC)
+df_devops$lineas_cambiadas <- round(
+  pmax(10, (df_devops$lead_time_horas * 12) + rnorm(n, mean = 50, sd = 120))
+)
+
+# Variables de estabilidad: Bugs y Estado del Despliegue
+df_devops$num_bugs <- rpois(n, lambda = pmax(0.2, df_devops$lineas_cambiadas / 250))
+
+prob_fallo <- pmin(0.65, 0.04 + (df_devops$num_bugs * 0.08) + (df_devops$lead_time_horas / 600))
+df_devops$deploy_status <- sapply(prob_fallo, function(p) {
+  sample(c("success", "failed", "rolled_back"), size = 1, prob = c(1 - p, p * 0.7, p * 0.3))
+})
+
+# Exportación del archivo físico exigido por la pauta
+write.csv(df_devops, "devops_metrics.csv", row.names = FALSE)
+```
+
+---
+
+# 3. ¿Cómo se comportan los tiempos de entrega?
+
+## 3.1 Valores centrales y el problema de los casos atípicos
+
+Cuando miramos los datos brutos, la media aritmética sube drásticamente debido a un puñado de incidentes críticos que quedaron estancados por días. 
+
+Para ver el impacto real de estas distorsiones, comparamos las métricas globales contra un filtrado usando el criterio del Rango Intercuartílico (IQR de Tukey), que corta las colas excesivas:
+
+```{r univariado}
+lead_times <- df_devops$lead_time_horas
+
+calcular_moda <- function(x) {
+  tabla_frec <- table(round(x, 1))
+  as.numeric(names(tabla_frec[tabla_frec == max(tabla_frec)]))[1]
+}
+
+# Medidas globales
+media_global     <- mean(lead_times)
+mediana_global   <- median(lead_times)
+moda_global      <- calcular_moda(lead_times)
+desv_std_global  <- sd(lead_times)
+asimetria_global <- moments::skewness(lead_times)
+curtosis_global  <- moments::kurtosis(lead_times)
+
+# Vallas de Tukey
+q1 <- quantile(lead_times, 0.25)
+q3 <- quantile(lead_times, 0.75)
+iqr_val <- IQR(lead_times)
+umbral_superior <- q3 + 1.5 * iqr_val
+
+lead_times_limpios <- lead_times[lead_times <= umbral_superior]
+
+# Medidas sin valores atípicos
+media_iqr     <- mean(lead_times_limpios)
+mediana_iqr   <- median(lead_times_limpios)
+moda_iqr      <- calcular_moda(lead_times_limpios)
+desv_std_iqr  <- sd(lead_times_limpios)
+asimetria_iqr <- moments::skewness(lead_times_limpios)
+curtosis_iqr  <- moments::kurtosis(lead_times_limpios)
+
+tabla_comparativa <- data.frame(
+  Metrica = c("Media (Horas)", "Mediana (Horas)", "Moda Principal (Horas)", 
+              "Desviación Estándar (Horas)", "Coeficiente Asimetría", "Curtosis"),
+  Muestra_Completa = round(c(media_global, mediana_global, moda_global, 
+                             desv_std_global, asimetria_global, curtosis_global), 2),
+  Sin_Atipicos_IQR = round(c(media_iqr, mediana_iqr, moda_iqr, 
+                           desv_std_iqr, asimetria_iqr, curtosis_iqr), 2)
+)
+
+knitr::kable(tabla_comparativa, caption = "Contraste univariado: Antes y después de filtrar valores atípicos")
+```
+
+```{r panel_graficos, fig.width=10, fig.height=9, fig.align='center'}
+# 1. Configurar panel 2x2 con márgenes adecuados
+par(mfrow = c(2, 2), mar = c(4.2, 4.2, 3.2, 1.2), mgp = c(2.5, 0.8, 0))
+
+# --- Gráfico 1: Histograma Global ---
+hist(df_devops$lead_time_horas, 
+     breaks = 40, 
+     col = "#6baed6", 
+     border = "white",
+     main = "Distribución del Tiempo de Entrega",
+     sub  = "Comportamiento bimodal: cambios rápidos vs. complejos",
+     xlab = "Horas transcurridas", 
+     ylab = "Cantidad de Cambios", 
+     las = 1, cex.main = 0.95, cex.sub = 0.75, cex.axis = 0.85, cex.lab = 0.85)
+
+abline(v = media_global, col = "#de2d26", lwd = 2, lty = 2)
+abline(v = mediana_global, col = "#31a354", lwd = 2, lty = 1)
+abline(v = umbral_superior, col = "#756bb1", lwd = 2, lty = 3)
+
+legend("topright", 
+       legend = c(paste("Media:", round(media_global, 1), "h"),
+                  paste("Mediana:", round(mediana_global, 1), "h"),
+                  paste("Límite Atípicos:", round(umbral_superior, 1), "h")),
+       col = c("#de2d26", "#31a354", "#756bb1"), 
+       lty = c(2, 1, 3), lwd = 2, bty = "n", cex = 0.75)
+
+# --- Gráfico 2: Diagrama de Caja Global ---
+boxplot(df_devops$lead_time_horas, 
+        horizontal = TRUE, 
+        col = "#9ecae1", 
+        border = "#08519c",
+        main = "Dispersión Global y Valores Atípicos",
+        sub  = "Identificación de colas largas con criterio IQR",
+        xlab = "Horas", 
+        las = 1, cex.main = 0.95, cex.sub = 0.75, cex.axis = 0.85, cex.lab = 0.85,
+        outcol = "#cb181d", pch = 19, cex = 0.5)
+
+abline(v = umbral_superior, col = "#756bb1", lwd = 2, lty = 3)
+
+# --- Gráfico 3: Diagrama de Caja por Equipo ---
+boxplot(lead_time_horas ~ equipo, 
+        data = df_devops, 
+        col = c("#c7e9c0", "#bcbddc", "#fdae6b", "#fdd0a2"), 
+        border = "#252525",
+        main = "Tiempos por Equipo de Desarrollo",
+        sub  = "Variabilidad operativa entre grupos",
+        xlab = "Equipo", 
+        ylab = "Horas", 
+        las = 1, cex.main = 0.95, cex.sub = 0.75, cex.axis = 0.85, cex.lab = 0.85,
+        outcol = "#e6550d", pch = 16, cex = 0.5)
+
+# --- Gráfico 4: Diagrama de Caja por Prioridad ---
+df_devops$prioridad_factor <- factor(df_devops$prioridad, 
+                                     levels = c("Crítica", "Alta", "Media", "Baja"))
+
+boxplot(lead_time_horas ~ prioridad_factor, 
+        data = df_devops, 
+        col = c("#ff9999", "#ffcc99", "#ffff99", "#d9f0a3"), 
+        border = "#252525",
+        main = "Tiempos por Prioridad del Cambio",
+        sub  = "Comportamiento del flujo según urgencia",
+        xlab = "Prioridad", 
+        ylab = "Horas", 
+        las = 1, cex.main = 0.95, cex.sub = 0.75, cex.axis = 0.85, cex.lab = 0.85,
+        outcol = "#de2d26", pch = 16, cex = 0.5)
+```
